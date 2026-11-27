@@ -11,10 +11,12 @@ import jwt
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from jwks_server.auth_logs import log_auth_request
 from jwks_server.keys import KeyRecord, KeyStore
 from jwks_server.users import register_user
+from jwks_server.rate_limiter import RateLimiter
 
 
 JWKS_PATH = "/.well-known/jwks.json"
@@ -58,6 +60,12 @@ def create_app(store: KeyStore | None = None) -> FastAPI:
 
     key_store = store if store is not None else KeyStore()
 
+    # Allow 10 authentication requests per second per IP.
+    rate_limiter = RateLimiter(
+        max_requests=10,
+        window_seconds=1,
+    )
+
     app = FastAPI(
         title="JWKS Server",
         docs_url=None,
@@ -78,7 +86,18 @@ def create_app(store: KeyStore | None = None) -> FastAPI:
 
     @app.post(AUTH_PATH, response_class=PlainTextResponse)
     async def auth(request: Request) -> str:
-        """Mock-authenticate the caller and log the request."""
+        """Mock-authenticate, enforce rate limits, and log requests."""
+
+        # Retrieve the client's IP address.
+        request_ip = request.client.host if request.client else "unknown"
+
+        # Reject excessive requests before expensive operations.
+        if not rate_limiter.allow_request(request_ip):
+            raise HTTPException(
+                status_code=429,
+                detail="Too Many Requests",
+                headers={"Retry-After": "1"},
+            )
 
         username = None
 
@@ -95,32 +114,36 @@ def create_app(store: KeyStore | None = None) -> FastAPI:
         except (json.JSONDecodeError, UnicodeDecodeError):
             pass
 
-        # Retrieve the client's IP address.
-        request_ip = request.client.host if request.client else "unknown"
-
-        # Select the appropriate RSA key.
+        # Determine whether an expired token was requested.
         expired = "expired" in request.query_params
 
-        if expired:
-            record = key_store.expired_key()
-        else:
-            record = key_store.active_key()
+        def authenticate() -> str:
+            """Perform blocking authentication operations."""
 
-        # Generate the signed JWT.
-        token = issue_token(
-            record,
-            key_store.now(),
-            expired=expired,
-        )
+            # Select the appropriate RSA key.
+            if expired:
+                record = key_store.expired_key()
+            else:
+                record = key_store.active_key()
 
-        # Record the successful request in SQLite.
-        log_auth_request(
-            request_ip,
-            username,
-            key_store._db_path,
-        )
+            # Generate the signed JWT.
+            token = issue_token(
+                record,
+                key_store.now(),
+                expired=expired,
+            )
 
-        return token
+            # Log only successful authentication requests.
+            log_auth_request(
+                request_ip,
+                username,
+                key_store._db_path,
+            )
+
+            return token
+
+        # Prevent blocking the asynchronous event loop.
+        return await run_in_threadpool(authenticate)
 
     @app.post("/register", status_code=201)
     def register(details: RegistrationRequest):

@@ -5,6 +5,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import jwt
+import sqlite3
+
+from fastapi import HTTPException
+from pydantic import BaseModel
+
+from jwks_server.users import register_user
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 
@@ -16,6 +22,9 @@ TOKEN_TTL = timedelta(minutes=30)
 MOCK_SUBJECT = "userABC"  # authentication is mocked for this project
 ALGORITHM = "RS256"
 
+class RegistrationRequest(BaseModel):
+    username: str
+    email: str
 
 def issue_token(record: KeyRecord, now: datetime, *, expired: bool) -> str:
     """Sign a JWT with ``record``; the ``kid`` header lets verifiers find the key.
@@ -64,5 +73,30 @@ def create_app(store: KeyStore | None = None) -> FastAPI:
         expired = "expired" in request.query_params
         record = key_store.expired_key() if expired else key_store.active_key()
         return issue_token(record, key_store.now(), expired=expired)
+    @app.post("/register", status_code=201)
 
+    def register(details: RegistrationRequest):
+        """Register a new user."""
+
+        if not details.username.strip() or not details.email.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Username and email are required",
+            )
+
+        try:
+            password = register_user(
+                details.username,
+                details.email,
+                key_store._db_path,
+            )
+
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="Username or email already exists",
+            ) from error
+
+        return {"password": password}
+        
     return app
